@@ -98,6 +98,11 @@ import {
   refitWhenTerminalFontLoads,
   TERMINAL_FONT_FAMILY,
 } from "@/lib/terminal-font-refit";
+import {
+  probeWebglSupport,
+  shouldUseWebglRenderer,
+  textNeedsDomShaping,
+} from "@/lib/xterm-webgl-gating";
 import { loseWebglContexts } from "@/lib/xterm-webgl-release";
 import { PluginSlot } from "@/plugins";
 import { useTheme } from "@/themes";
@@ -936,13 +941,28 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     // in DevTools device mode that often produces *visually* much larger cells
     // than `fontSize` suggests — users see "huge" text even at 7–9px settings.
     // The canvas/DOM renderer tracks `fontSize` faithfully; use it for narrow
-    // hosts.  Wide layouts still get WebGL for crisp box-drawing.
-    const useWebgl = terminalTierWidthPx(host) >= 768;
+    // hosts.  Wide layouts still get WebGL for crisp box-drawing — but only
+    // where WebGL actually works. Safari's atlas garbles box-drawing glyphs
+    // (#18773), hosts whose only GL is a software rasterizer (llvmpipe,
+    // SwiftShader) crash the addon with "(regl) webgl not supported"
+    // (#45520), and without any GL context there is nothing to load at all.
+    // Everything else falls back to the default DOM renderer.
+    const userAgent = typeof navigator !== "undefined" ? navigator.userAgent : "";
+    const useWebgl = shouldUseWebglRenderer({
+      layoutWidthPx: terminalTierWidthPx(host),
+      userAgent,
+      support: probeWebglSupport(document),
+    });
+    // Set once the addon is live; the PTY write path below drops it again if
+    // shaping-requiring text (Bengali conjuncts, Devanagari, Khmer…) arrives,
+    // so xterm re-renders through the DOM renderer (#58685).
+    let webglAddon: { dispose(): void } | null = null;
     if (useWebgl) {
       try {
         const webgl = new WebglAddon();
         webgl.onContextLoss(() => webgl.dispose());
         term.loadAddon(webgl);
+        webglAddon = webgl;
       } catch (err) {
         console.warn(
           "[hermes-chat] WebGL renderer unavailable; falling back to default",
@@ -1427,6 +1447,18 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       )
         ? () => termRef.current?.scrollToBottom()
         : undefined;
+      // Complex scripts (Bengali conjuncts etc.) cannot be drawn from a
+      // per-glyph atlas — the first such payload swaps to the DOM renderer,
+      // whose text shaping renders them properly (#58685). Disposing the
+      // addon makes xterm fall back and redraw on its own.
+      if (webglAddon && textNeedsDomShaping(text)) {
+        try {
+          webglAddon.dispose();
+        } catch {
+          /* already gone */
+        }
+        webglAddon = null;
+      }
       term.write(rendered, followScroll);
       noteResumePtyChunk(rendered);
     };
