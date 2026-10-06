@@ -710,11 +710,30 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       })().catch(reportImageUploadError);
     };
     const handleBrowserPaste = (ev: ClipboardEvent) => {
+      // Capture-phase on the host, so this runs before xterm's own paste
+      // listeners on the textarea / .xterm element (stopPropagation below
+      // keeps them from firing at all).
       const files = imageFilesFromTransfer(ev.clipboardData);
-      if (!files.length) return;
-      ev.preventDefault();
-      ev.stopPropagation();
-      uploadAndAttachImages(files);
+      if (files.length) {
+        ev.preventDefault();
+        ev.stopPropagation();
+        uploadAndAttachImages(files);
+        return;
+      }
+      // Plain-text paste (#52471): xterm's own paste listener clears the
+      // hidden textarea, but the browser's default action — inserting the
+      // pasted text into that textarea — runs AFTER event dispatch, so the
+      // stale value survives and the next typed character gets duplicated
+      // ("when" → "whenn"). Cancel the native paste and deliver the text
+      // through term.paste() exactly once: the same route the Ctrl/Cmd+V
+      // keydown interception uses, which resets the textarea with no
+      // pending default action behind it.
+      const text = ev.clipboardData?.getData("text/plain");
+      if (text) {
+        ev.preventDefault();
+        ev.stopPropagation();
+        term.paste(text);
+      }
     };
     const handleBrowserDragOver = (ev: DragEvent) => {
       if (!transferMayContainImage(ev.dataTransfer)) return;
